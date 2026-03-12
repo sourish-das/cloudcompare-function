@@ -1,0 +1,1056 @@
+image.png
+image.png
+image.png
+2 images
+You said:
+price not correct also the name is having _ instead of -
+Copilot said:
+Copilot
+
+Reasoning completed in 8 steps
+Got it — two issues:
+
+Prices for RHEL don’t match the Google calculator, and
+Recommended Machine displays with underscores (e.g., c4_highcpu_2 instead of c4-highcpu-2).
+Let’s fix both cleanly.
+
+Why your RHEL price is off
+Right now we synthesize RHEL as:
+
+RHEL price = Linux base + (vcpu * rhelCoreRate)
+That assumes RHEL is charged per‑vCPU‑hour. On Google Cloud, premium images (RHEL, SLES, Windows) are billed as image license adders that are per‑instance and depend on the machine type (not necessarily linear per‑vCPU). The official docs explicitly say “The price for a premium image depends on which machine type you use… All prices for premium images are in addition to charges for using a machine type.”
+google
+
+So a flat per‑vCPU uplift can over/under‑shoot compared to the calculator, which is applying the image adder for the chosen machine type (e.g., c4-highcpu-2, t2d-standard-1). That explains your screenshots where our hourly is higher than the calculator for Paid: Red Hat Enterprise Linux.
+
+Conclusion: For GCP we should prefer per‑instance RHEL image adders from Catalog (when available) and use env fallback only if not found. This aligns with Google’s premium image pricing guidance.
+google
+
+(Industry news also confirms a shift to vCPU‑based models for some clouds, but GCP still presents RHEL as premium image adders tied to machine types in docs and calculator behavior.)
+infoq
++1
+
+The right fix (minimal & safe)
+A) Pricing accuracy: switch RHEL synthesis to per‑instance image adder (Catalog‑driven)
+What we’ll do
+
+Discover RHEL per‑instance adder SKUs in the Catalog for the region:
+Look for Compute SKUs in‑region whose description indicates RHEL / Red Hat Enterprise Linux and that are per‑instance (contain Instance|VM) and reference a machine type token (e.g., c4-highcpu-2, t2d-standard-1).
+Build a map: rhelAddonByMachineType[mt] = adderPricePerHour.
+Synthesize RHEL as:
+rhelPrice = linuxBase + rhelAddonByMachineType[mt]
+Only if we can’t find an adder for that machine type, optionally fall back to env (GCP_RHEL_RATE_PER_VCPU) — but keep it off by default to avoid wrong numbers.
+This aligns with GCP’s described behavior for premium images.
+google
+
+Patch for scripts/providers/gcp.fetch.js (drop‑in)
+
+Adds a new helper buildRhelPerInstanceAdders() (local in fetcher for now), replaces the current per‑vCPU RHEL synthesis, and leaves Windows logic unchanged. Also keeps your existing logs.
+
+
+
+
+JavaScript
+// ...existing imports...
+
+// --- NEW: build per-instance RHEL addon map from Catalog SKUs ---
+function buildRhelPerInstanceAdders(allSkus, region) {
+  const map = Object.create(null);
+  const inRegion = (sku) => {
+    const cat = sku?.category || {};
+    if (cat.resourceFamily !== "Compute") return false;
+    if (cat.usageType && !/OnDemand/i.test(cat.usageType)) return false;
+    return regionMatches(sku.serviceRegions, region);
+  };
+
+  // candidates: RHEL premium image license SKUs that look per-instance and mention a machine type
+  for (const sku of (allSkus || [])) {
+    if (!inRegion(sku)) continue;
+    const name = String(sku.description || sku.displayName || "").toLowerCase();
+
+    // must look like RHEL premium image
+    if (!/(rhel|red\s*hat)/.test(name)) continue;
+    // exclude things we don't want
+    if (/(byol|sles|suse|windows|sql|sap|gpu|local ssd|persistent disk|commitment|spot|preemptible)/.test(name)) continue;
+    // per-instance wording (like Windows block)
+    if (!/\b(instance|vm)\b/.test(name)) continue;
+
+    // try to extract a predefined machine type from the text
+    // (we already have the robust regex in lib/gcp.inferMachineType; reuse it)
+    const mt = inferMachineType(sku);
+    if (!mt) continue;
+
+    const price = extractHourlyPrice(sku.pricingInfo);
+    if (!(price > 0)) continue;
+
+    // Lowest wins if multiple SKUs match same machine type
+    const prev = map[mt];
+    if (!prev || price < prev) map[mt] = price;
+  }
+
+ 
+
+Show more lines
+Replace the current RHEL synthesis block in your fetcher:
+
+
+
+
+Diff
+-  // 5) Synthesize RHEL rows from Linux base + per-vCPU RHEL license (Arm + x86)
+-  if (rhelCoreRate) {
+-    const linuxEntries = Object.values(gcp_price_list).filter(v => v.os === "Linux");
+-    const existingRhel = new Set(
+-      Object.values(gcp_price_list)
+-        .filter(v => v.os === "RHEL")
+-        .map(v => `${v.machine_type}__${v.region}`)
+-    );
+-    let addedRhel = 0;
+-    for (const base of linuxEntries) {
+-      const rhelKey = `${base.machine_type}__${base.region}`;
+-      if (existingRhel.has(rhelKey)) continue;
+-      const vcpu = Number(base.vcpu || 0);
+-      const basePrice = Number(base.price_per_hour || 0);
+-      if (!Number.isFinite(vcpu) || vcpu <= 0) continue;
+-      if (!Number.isFinite(basePrice) || basePrice <= 0) continue;
+-      const rhelPrice = basePrice + (vcpu * rhelCoreRate);
+-      if (!Number.isFinite(rhelPrice) || rhelPrice <= 0) continue;
+-      const key = `sku_${++counter}`;
+-      gcp_price_list[key] = { /* ...RHEL row... */ };
+-      addedRhel++;
+-    }
+-    console.log(`[GCP] Synthesized RHEL rows: ${addedRhel}`);
+-  }
++  // 5) Synthesize RHEL rows from Linux base + per-instance RHEL image adder (preferred)
++  {
++    const rhelAdders = buildRhelPerInstanceAdders(allSkus, REGION);
++    const linuxEntries = Object.values(gcp_price_list).filter(v => v.os === "Linux");
++    const existingRhel = new Set(
++      Object.values(gcp_price_list)
++        .filter(v => v.os === "RHEL")
++        .map(v => `${v.machine_type}__${v.region}`)
++    );
++    let addedRhel = 0, missingAdders = 0;
++    for (const base of linuxEntries) {
++      const keyMt = String(base.machine_type).toLowerCase();
++      const adder = rhelAdders[keyMt];
++      if (!Number.isFinite(adder) || !(adder > 0)) { missingAdders++; continue; }
++      const rhelKey = `${base.machine_type}__${base.region}`;
++      if (existingRhel.has(rhelKey)) continue;
++      const basePrice = Number(base.price_per_hour || 0);
++      if (!(basePrice > 0)) continue;
++      const rhelPrice = basePrice + adder;
++      const key = `sku_${++counter}`;
++      gcp_price_list[key] = {
++        region: REGION,
++        machine_type: base.machine_type,
++        os: "RHEL",
++        price_per_hour: rhelPrice,
++        vcpu: base.vcpu,
++        memory_gb: base.memory_gb,
++        __src: (base.__src || "catalog") + "+rhel(addon)"
++      };
++      addedRhel++;
++    }
++    console.log(`[GCP] Synthesized RHEL rows (addon): ${addedRhel}, missing-adders:${missingAdders}`);
++
++    // Optional: if many adders missing and you *really* want coverage,
++    // enable env fallback (off by default).
++    const FALLBACK_VCPU = Number(process.env.GCP_RHEL_RATE_PER_VCPU || 0) || 0;
++    if (FALLBACK_VCPU > 0 && missingAdders > 0) {
++      let addedFb = 0;
++      for (const base of linuxEntries) {
++        const rhelKey = `${base.machine_type}__${base.region}`;
++        if (existingRhel.has(rhelKey)) continue;
++        if (gcp_price_list[rhelKey]) continue;
++        const keyMt = String(base.machine_type).toLowerCase();
++        if (Number.isFinite(rhelAdders[keyMt]) && rhelAdders[keyMt] > 0) continue; // already handled
++        const vcpu = Number(base.vcpu || 0);
++        const basePrice = Number(base.price_per_hour || 0);
++        if (!(vcpu > 0 && basePrice > 0)) continue;
++        const rhelPrice = basePrice + vcpu * FALLBACK_VCPU;
++        const key = `sku_${++counter}`;
++        gcp_price_list[key] = {
++          region: REGION,
++          machine_type: base.machine_type,
++          os: "RHEL",
++          price_per_hour: rhelPrice,
++          vcpu: base.vcpu
+
+Show more lines
+What this gives you
+
+If GCP Catalog exposes per‑instance RHEL image adders for your region and machine types, you’ll match the calculator (Linux base + image adder).
+google
+If Catalog doesn’t expose a given adder, you can choose to use an env fallback (keep it unset to avoid off values).
+If you want, I can also push this logic down into lib/gcp.js as buildRhelPerInstanceAdders() next to the Windows resolver.
+
+B) UI: show machine type with hyphens
+You’re rendering Recommended Machine: c4_highcpu_2 because the provider emits instance with underscores for internal matching:
+
+
+
+
+JavaScript
+const instance = item.machine_type.replace(/-/g, "_");
+Two minimal options (pick one):
+
+Option 1 — UI-only fix (safest):
+Where you display the instance name on the card, render:
+
+
+
+
+JavaScript
+const displayName = rec.instance.replace(/_/g, "-");
+This is a one‑liner in docs/ui/* (likely the card render in ui/utils.js or ui/matchers.js where you populate the “Recommended Machine”). No change to the data shape.
+
+Option 2 — Provider adds a display field:
+Augment rows with a machineType (hyphenated) and keep instance for lookups:
+
+
+
+
+Diff
+rows.push({
+-  instance,
++  instance,                // underscore (internal key)
++  machineType: item.machine_type, // hyphenated for UI
+   category, vcpu, ram, pricePerHourUSD: price, region: REGION,
+   os, series, arch, source
+});
+Then have the UI prefer row.machineType if present; else fallback to row.instance.replace(/_/g,"-").
+
+I recommend Option 1 right now to keep it simple and avoid ripples.
+
+Quick validation checklist
+Enable debug once to see what we learned from Catalog:
+
+Set GCP_DEBUG_RHEL=1 in the workflow, and I’ll log a small sample of candidate RHEL adders (I can add a debug print in buildRhelPerInstanceAdders if you want).
+Re-run the workflow and compare:
+
+For c4-highcpu-2 (us-east1), confirm your hourly equals (Linux base + RHEL image adder).
+For t2d-standard-1 (us-east1), do the same.
+UI name:
+
+After the UI one‑liner, your card should show c4-highcpu-2, t2d-standard-1, etc.
+Why this aligns with Google’s behavior
+Google’s docs clearly treat RHEL as a premium image adder (not purely vCPU‑linear), added to the machine type cost, and not region‑dependent (license price is global), which is exactly how the calculator behaves.
+google
+GCP licensing docs reinforce that premium OS licenses are separate adders and are not BYOL unless you select BYOL images (different license strings).
+google
+Want me to push tiny diffs?
+Provider (fetcher): I can give you the complete gcp.fetch.js with the per‑instance adder synthesis block wired in (keeping Windows as is).
+UI: Tell me the exact file where you render the Recommended Machine line (likely docs/ui/utils.js), and I’ll give you a surgical 2‑line diff for the hyphen display.
+Once we switch to per‑instance adders, your RHEL price should match the calculator numbers shown in your screenshots.
+
+Sources
+Favicon typeFavicon typeFavicon type
+
+
+
+
+
+
+
+You said:
+here is utils.js 
+
+// docs/ui/utils.js
+export const HRS_PER_MONTH = 730;
+
+/* ---------- Formatting & math helpers ---------- */
+export function fmt(n) {
+  return (n == null || isNaN(n)) ? "—" : `$${Number(n).toFixed(4)}`;
+}
+
+export function fmtDelta(n) {
+  if (n == null || isNaN(n)) return "—";
+  const v = Number(n);
+  const sign = v > 0 ? "+" : "";
+  return `${sign}$${v.toFixed(4)}`;
+}
+
+export function monthly(ph) {
+  return (ph == null || isNaN(ph)) ? null : Number(ph) * HRS_PER_MONTH;
+}
+
+export function sumSafe(a, b) {
+  const na = (a == null || isNaN(a)) ? 0 : Number(a);
+  const nb = (b == null || isNaN(b)) ? 0 : Number(b); // FIX: use b, not a
+  if (a == null && b == null) return null;
+  return na + nb;
+}
+
+/* ---------- DOM helpers ---------- */
+export function fillSelect(id, items) {
+  const el = document.getElementById(id);
+  if (!el) return;
+
+  el.innerHTML = "";
+
+  // Accept strings (used directly as value/text) or objects
+  for (const it of (items || [])) {
+    const opt = document.createElement("option");
+
+    if (typeof it === "string") {
+      opt.value = it;
+      opt.textContent = it;
+    } else if (it && typeof it === "object") {
+      opt.value = (it.value != null) ? String(it.value) : "";
+      opt.textContent = (it.text != null) ? String(it.text) : String(it.value ?? "");
+      if (it.disabled) opt.disabled = true;
+      if (it.selected) opt.selected = true;
+    } else {
+      continue;
+    }
+
+    el.appendChild(opt);
+  }
+}
+
+/**
+ * Ensures an option with given value exists in the select.
+ * If not present, insert it after the "Linux" option (if found),
+ * otherwise append at the end.
+ */
+export function ensureSelectOption(id, value, label) {
+  const el = document.getElementById(id);
+  if (!el) return;
+
+  const needle = String(value).toLowerCase();
+  const exists = Array.from(el.options).some(o => String(o.value).toLowerCase() === needle);
+  if (exists) return;
+
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = label || String(value);
+
+  // Try to place after Linux for nicer order
+  const linuxIdx = Array.from(el.options).findIndex(o => String(o.value).toLowerCase() === "linux");
+  if (linuxIdx >= 0 && linuxIdx < el.options.length - 1) {
+    el.add(opt, el.options[linuxIdx + 1]);
+  } else {
+    el.add(opt);
+  }
+}
+
+export function setSelectValue(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const current = el.value;
+  const match = Array.from(el.options).find(o => o.value == value);
+  el.value = match ? value : current;
+}
+
+/**
+ * Set text into an element, optionally allowing trusted HTML.
+ * Use { html: true } ONLY for known, code-generated strings.
+ */
+export function safeSetText(id, value, { html = false } = {}) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const v = (value == null) ? "" : String(value);
+  if (html) {
+    el.innerHTML = v; // trusted, code-generated strings only
+  } else {
+    el.textContent = v; // default: escape HTML
+  }
+}
+
+export function appendToText(id, extra) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = (el.textContent || "") + extra;
+}
+
+export function setStatus(msg, level = "info") {
+  const el = document.getElementById("status");
+  if (!el) return;
+  const err  = "var(--err,#b91c1c)";
+  const warn = "var(--warn,#b45309)";
+  const mut  = "var(--muted,#666)";
+  el.textContent = msg;
+  el.style.color =
+    (level === "error") ? err :
+    (level === "warn")  ? warn : mut;
+}
+
+/* ---------- Numeric helpers ---------- */
+export function nearestCeil(requested, allowed) {
+  const sorted = [...(allowed || [])].sort((a, b) => a - b);
+  for (const s of sorted) if (requested <= s) return s;
+  return sorted.length ? sorted[sorted.length - 1] : null;
+}
+
+/* ---------- Azure disk label helpers ---------- */
+export function sizeToAzureSku(type, size) {
+  if (!isFinite(size)) return null;
+  if (type === "ssd") {
+    const map = {4:"E1",8:"E2",16:"E3",32:"E4",64:"E6",128:"E10",256:"E15",512:"E20",1024:"E30",2048:"E40",4096:"E50"};
+    return map[size] || null;
+  } else {
+    const map = {32:"S4",64:"S6",128:"S10",256:"S15",512:"S20",1024:"S30",2048:"S40",4096:"S50"};
+    return map[size] || null;
+  }
+}
+
+/* ---------- Storage price resolvers ---------- */
+/**
+ * AWS: simple per-GB × amount table (gp3 for SSD, st1 for HDD).
+ * Returns monthly USD or null.
+ */
+export function getAwsStorageMonthlyFromCfg(type, gb, awsCfg) {
+  if (!isFinite(gb) || gb <= 0) return null;
+  const t = (type || "hdd").toLowerCase();
+  if (t === "ssd") {
+    return gb * Number(awsCfg?.ssd_per_gb_month ?? 0.08);
+  }
+  return gb * Number(awsCfg?.hdd_st1_per_gb_month ?? 0.045);
+}
+
+/**
+ * Azure: using monthly lookup tables.
+ * Returns { sku, size, monthlyUSD, adjusted }
+ */
+export function getAzureStorageSkuAndMonthlyFromCfg(type, gb, azCfg) {
+  const t = (type || "hdd").toLowerCase();
+  if (!isFinite(gb) || gb <= 0)
+    return { sku: null, size: null, monthlyUSD: null, adjusted: false };
+
+  const ssdTbl = azCfg?.ssd_monthly || {};
+  const hddTbl = azCfg?.hdd_monthly || {};
+
+  if (t === "ssd") {
+    const size = nearestCeil(gb, Object.keys(ssdTbl).map(Number));
+    const monthlyUSD = size != null ? (ssdTbl[size] ?? null) : null;
+    const sku = sizeToAzureSku("ssd", size);
+    return { sku, size, monthlyUSD, adjusted: (size != null && size !== gb) };
+  }
+
+  // HDD branch
+  const allowed = Object.keys(hddTbl).map(Number);
+  let size = nearestCeil(gb, allowed);
+  if (size == null && allowed.length) size = allowed.sort((a, b) => a - b)[0];
+  if (size != null && size < 32) size = 32;
+
+  const monthlyUSD = size != null ? (hddTbl[size] ?? null) : null;
+  const sku = sizeToAzureSku("hdd", size);
+  return { sku, size, monthlyUSD, adjusted: (size != null && size !== gb) };
+}
+
+/* ---------- GCP storage pricing ---------- */
+/**
+ * GCP PD-SSD and PD-Standard:
+ * Simple per-GB rate, same as AWS model.
+ */
+export function getGcpStorageMonthlyFromCfg(type, gb, gcpCfg) {
+  if (!isFinite(gb) || gb <= 0) return null;
+  const t = (type || "hdd").toLowerCase();
+  if (t === "ssd") {
+    return gb * Number(gcpCfg?.ssd_per_gb_month ?? 0.17);
+  }
+  return gb * Number(gcpCfg?.hdd_per_gb_month ?? 0.04);
+}
+
+/* ---------- OCI storage pricing ---------- */
+/**
+ * OCI Block Volume:
+ * - One base price (USD per GB-month)
+ * - Same base price for HDD/SSD UI selection
+ * - Performance via VPUs (not modeled here)
+ */
+export function getOciStorageMonthlyFromCfg(gb, ociCfg) {
+  if (!isFinite(gb) || gb <= 0) return null;
+  return gb * Number(ociCfg?.block_volume_gb_month ?? 0.0255);
+}
+
+/* ---------- Reset all UI fields (AWS + Azure + GCP + OCI) ---------- */
+export function resetCards() {
+  // Titles use trusted HTML for bold labels; everything else stays text-only.
+  safeSetText("awsInstance", `<strong>Recommended Instance:</strong> …`, { html: true });
+  safeSetText("awsCpu",     "vCPU: …");
+  safeSetText("awsRam",     "RAM: …");
+  safeSetText("awsPrice",   "EC2 Price/hr: —");
+  safeSetText("awsMonthly", "≈ EC2 Monthly: —");
+  safeSetText("awsStorageSel",     "Storage: —");
+  safeSetText("awsStoragePriceHrLabel", "EBS Price/hr:");
+  safeSetText("awsStoragePriceHr", "—");
+  safeSetText("awsStorageMonthlyLabel", "≈ EBS Monthly:");
+  safeSetText("awsStorageMonthly", "—");
+  safeSetText("awsTotalHr",        "—");
+  safeSetText("awsTotalMonthly",   "—");
+
+  safeSetText("azInstance", `<strong>Recommended VM Size:</strong> …`, { html: true });
+  safeSetText("azCpu",     "vCPU: …");
+  safeSetText("azRam",     "RAM: …");
+  safeSetText("azPrice",   "VM Price/hr: —");
+  safeSetText("azMonthly", "≈ VM Monthly: —");
+  safeSetText("azStorageSel",     "Storage: —");
+  safeSetText("azStoragePriceHrLabel", "Azure Disk Price/hr:");
+  safeSetText("azStoragePriceHr", "—");
+  safeSetText("azStorageMonthlyLabel", "≈ Azure Disk Monthly:");
+  safeSetText("azStorageMonthly", "—");
+  safeSetText("azTotalHr",        "—");
+  safeSetText("azTotalMonthly",   "—");
+
+  safeSetText("gcpInstance", `<strong>Recommended Machine:</strong> …`, { html: true });
+  safeSetText("gcpCpu",     "vCPU: …");
+  safeSetText("gcpRam",     "RAM: …");
+  safeSetText("gcpPrice",   "Compute Engine Price/hr: —");
+  safeSetText("gcpMonthly", "≈ Compute Engine Monthly: —");
+  safeSetText("gcpStorageSel",     "Storage: —");
+  safeSetText("gcpStoragePriceHrLabel", "Persistent Disk Price/hr:");
+  safeSetText("gcpStoragePriceHr", "—");
+  safeSetText("gcpStorageMonthlyLabel", "≈ Persistent Disk Monthly:");
+  safeSetText("gcpStorageMonthly", "—");
+  safeSetText("gcpTotalHr",        "—");
+  safeSetText("gcpTotalMonthly",   "—");
+
+  safeSetText("ociInstance", `<strong>Recommended Machine:</strong> …`, { html: true });
+  safeSetText("ociCpu",     "vCPU: …");
+  safeSetText("ociRam",     "RAM: …");
+  safeSetText("ociPrice",   "Compute Price/hr: —");
+  safeSetText("ociMonthly", "≈ Compute Monthly: —");
+  safeSetText("ociStorageSel",     "Storage: —");
+  safeSetText("ociStoragePriceHrLabel", "Block Volume Price/hr:");
+  safeSetText("ociStoragePriceHr", "—");
+  safeSetText("ociStorageMonthlyLabel", "≈ Block Volume Monthly:");
+  safeSetText("ociStorageMonthly", "—");
+  safeSetText("ociTotalHr",        "—");
+  safeSetText("ociTotalMonthly",   "—");
+}
+Copilot said:
+Copilot
+
+Reasoning completed in 3 steps
+Thanks for the screenshots—two actionable fixes:
+
+Price mismatch for RHEL → switch to per‑instance RHEL image adders from the GCP Catalog (not a per‑vCPU uplift). This matches how Google bills premium images like RHEL (image adder + machine type base).
+google
+Name shows underscores → render the machine type with hyphens for the GCP card.
+Below are minimal, safe patches.
+
+1) UI name fix (underscores → hyphens)
+Add a tiny helper in your docs/ui/utils.js, then use it in your GCP card render.
+
+Patch: docs/ui/utils.js
+Add this helper near the other formatting helpers:
+
+
+
+
+JavaScript
+export function displayMachineName(name) {
+  if (name == null) return "";
+  return String(name).replace(/_/g, "-");
+}
+``
+That’s all you need in utils.js. ✅
+
+Where to use it
+Where you output the “Recommended Machine” for GCP (likely in docs/script.js inside your renderGcpCard(...) or similar), change just the display string:
+
+
+
+
+JavaScript
+import { safeSetText, displayMachineName /* ... */ } from "./ui/utils.js";
+
+// inside your GCP card render:
+const shownName = displayMachineName(rec.machineType || rec.instance);
+safeSetText("gcpInstance",
+  `<strong>Recommended Machine:</strong> ${shownName} (${region})`,
+  { html: true }
+);
+``
+This keeps the internal key (instance with underscores) intact for lookups, while the UI shows c4-highcpu-2, t2d-standard-1, etc.
+
+2) Accurate RHEL pricing for GCP
+Google bills RHEL as a premium image adder that is added to the base VM price and depends on machine type (the calculator behaves this way as well). So the correct synthesis is:
+
+RHEL hourly = Linux base hourly + RHEL image-adder for that machine type
+—not a pure per-vCPU uplift.
+google
+
+Patch: scripts/providers/gcp.fetch.js (surgical changes only)
+A. Add a local helper to learn per‑instance RHEL adders from Catalog SKUs:
+
+
+
+
+JavaScript
+function buildRhelPerInstanceAdders(allSkus, region) {
+  const map = Object.create(null);
+  const inRegion = (sku) => {
+    const cat = sku?.category || {};
+    if (cat.resourceFamily !== "Compute") return false;
+    if (cat.usageType && !/OnDemand/i.test(cat.usageType)) return false;
+    return regionMatches(sku.serviceRegions, region);
+  };
+
+  for (const sku of (allSkus || [])) {
+    if (!inRegion(sku)) continue;
+    const name = String(sku.description || sku.displayName || "").toLowerCase();
+
+    // Must be RHEL; exclude non-license noise
+    if (!/(rhel|red\s*hat)/.test(name)) continue;
+    if (/(byol|sles|suse|windows|sql|sap|gpu|local ssd|persistent disk|commitment|spot|preemptible)/.test(name)) continue;
+
+    // Per-instance wording
+    if (!/\b(instance|vm)\b/.test(name)) continue;
+
+    // Extract machine type (use the same robust inference you already have)
+    const mt = inferMachineType(sku);
+    if (!mt) continue;
+
+    const price = extractHourlyPrice(sku.pricingInfo);
+    if (!(price > 0)) continue;
+
+    if (!map[mt] || price < map[mt]) map[mt] = price; // keep the lowest
+  }
+  return map;
+}
+
+
+Show more lines
+B. Replace your current “RHEL synthesis” block with per‑instance adder logic:
+
+
+
+
+Diff
+-  // 5) Synthesize RHEL rows from Linux base + per-vCPU RHEL license (Arm + x86)
+-  if (rhelCoreRate) {
+-    const linuxEntries = Object.values(gcp_price_list).filter(v => v.os === "Linux");
+-    const existingRhel = new Set(
+-      Object.values(gcp_price_list)
+-        .filter(v => v.os === "RHEL")
+-        .map(v => `${v.machine_type}__${v.region}`)
+-    );
+-    let addedRhel = 0;
+-    for (const base of linuxEntries) {
+-      const rhelKey = `${base.machine_type}__${base.region}`;
+-      if (existingRhel.has(rhelKey)) continue;
+-      const vcpu = Number(base.vcpu || 0);
+-      const basePrice = Number(base.price_per_hour || 0);
+-      if (!Number.isFinite(vcpu) || vcpu <= 0) continue;
+-      if (!Number.isFinite(basePrice) || basePrice <= 0) continue;
+-      const rhelPrice = basePrice + (vcpu * rhelCoreRate);
+-      if (!Number.isFinite(rhelPrice) || rhelPrice <= 0) continue;
+-      const key = `sku_${++counter}`;
+-      gcp_price_list[key] = {
+-        region: REGION,
+-        machine_type: base.machine_type,
+-        os: "RHEL",
+-        price_per_hour: rhelPrice,
+-        vcpu: base.vcpu,
+-        memory_gb: base.memory_gb,
+-        __src: (base.__src || "catalog") + "+rhel"
+-      };
+-      addedRhel++;
+-    }
+-    console.log(`[GCP] Synthesized RHEL rows: ${addedRhel}`);
+-  }
++  // 5) Synthesize RHEL rows from Linux base + per-instance RHEL image adder (preferred)
++  {
++    const rhelAdders = buildRhelPerInstanceAdders(allSkus, REGION);
++    const linuxEntries = Object.values(gcp_price_list).filter(v => v.os === "Linux");
++    const existingRhel = new Set(
++      Object.values(gcp_price_list)
++        .filter(v => v.os === "RHEL")
++        .map(v => `${v.machine_type}__${v.region}`)
++    );
++    let addedRhel = 0, missingAdders = 0;
++    for (const base of linuxEntries) {
++      const mt = String(base.machine_type).toLowerCase();
++      const adder = rhelAdders[mt];
++      if (!(Number.isFinite(adder) && adder > 0)) { missingAdders++; continue; }
++      const rhelKey = `${base.machine_type}__${base.region}`;
++      if (existingRhel.has(rhelKey)) continue;
++      const basePrice = Number(base.price_per_hour || 0);
++      if (!(basePrice > 0)) continue;
++      const rhelPrice = basePrice + adder;
++      const key = `sku_${++counter}`;
++      gcp_price_list[key] = {
++        region: REGION,
++        machine_type: base.machine_type,
++        os: "RHEL",
++        price_per_hour: rhelPrice,
++        vcpu: base.vcpu,
++        memory_gb: base.memory_gb,
++        __src: (base.__src || "catalog") + "+rhel(addon)"
++      };
++      addedRhel++;
++    }
++    console.log(`[GCP] Synthesized RHEL rows (addon): ${addedRhel}, missing-adders:${missingAdders}`);
++
++    // Optional coverage: if you STILL want fallback for any missing adders,
++    // set GCP_RHEL_RATE_PER_VCPU (otherwise skip to avoid inaccuracies).
++    const FALLBACK_VCPU = Number(process.env.GCP_RHEL_RATE_PER_VCPU || 0) || 0;
++    if (FALLBACK_VCPU > 0 && missingAdders > 0) {
++      let addedFb = 0;
++      for (const base of linuxEntries) {
++        const mt = String(base.machine_type).toLowerCase();
++        if (Number.isFinite(rhelAdders[mt]) && rhelAdders[mt] > 0) continue;
++        const rhelKey = `${base.machine_type}__${base.region}`;
++        if (existingRhel.has(rhelKey)) continue;
++        const vcpu = Number(base.vcpu || 0);
++        const basePrice = Number(base.price_per_hour || 0);
++        if (!(vcpu > 0 && basePrice > 0)) continue;
++        const rhelPrice = basePrice + vcpu * FALLBACK_VCPU;
++        const key = `sku_${++counter}`;
++        gcp_price_list[key] = {
++          region: REGION,
++          machine_type: base.machine_type,
++          os: "RHEL",
++          price_per_hour: rhelPrice,
++          vcpu: base.vcpu,
++          memory_gb: base.memory_gb,
++          __src: (base.__src || "catalog") + `+rhel(fallback:${FALLBACK_VCPU})`
++        };
++        addedFb++;
++      }
++      console.log(`[GCP] Synthesized RHEL rows via FALLBACK per‑vCPU: ${addedFb}`);
++    }
++  }
+``
+
+Show more lines
+This mirrors how the GCP calculator composes RHEL costs—base machine + image adder—so your numbers should now align with the calculator for shapes like c4-highcpu-2 and t2d-standard-1.
+google
+
+Sanity re-run (quick steps)
+Apply both patches (utils + fetcher) and re‑run your workflow.
+In the logs:
+You should see something like:
+Synthesized RHEL rows (addon): N, missing-adders:M
+If missing-adders is > 0, leave FALLBACK OFF unless you explicitly want coverage at the expense of accuracy.
+Refresh your UI:
+The card title should show c4-highcpu-2 (hyphens).
+Compare hourly with the GCP calculator for Paid: Red Hat Enterprise Linux; they should match within rounding.
+Why this change is necessary
+Google premium images (RHEL/SLES/Windows) are licensed as image adders per instance that are added to the base VM price (not purely per‑vCPU); this is how both the public docs and the calculator model costs.
+google
+GCP licensing docs also separate premium OS license strings from VM resource costs.
+google
+If you want, I can give you:
+
+a ready PR patch for gcp.fetch.js and
+the exact renderGcpCard(...) two‑line change once you paste that function here.
+Sources
+Favicon typeFavicon type
+
+
+
+
+
+
+
+image.png
+image.png
+image.png
+
+3 images
+You said:
+got it lets go one by one before that one more obervation while selecting menory it is giving this from general family only instead of m1, m2, m3 and m4 , same for compute why 
+Copilot said:
+Copilot
+
+Reasoning completed in 2 steps
+Great catch. This behavior is coming from the classification policy you (we) encoded for GCP:
+
+Memory family = M/X series + any *-highmem-*
+Compute family = C series + any *-highcpu-*
+
+So when you pick Family = Memory, the recommender is allowed to consider c4a-highmem-* (compute series + highmem class) and if that’s cheaper for the requested vCPU/RAM, it gets picked over m1|m2|m3|m4. Likewise for Family = Compute, n2-highcpu-* or e2-highcpu-* can win over c* if cheaper. This is exactly what your current code intends per the comments and helpers in lib/gcp.js. (You’ll see that in the code path that classifies HIGHMEM and HIGHCPU with precedence over series, and in the “allowed prefixes” logic for the UI.)
+
+If you want strict families that mirror the GCP console:
+
+Compute → only C2/C2D/C3/C3D/C4/C4D/C4A/H3/H4/H4D
+Memory → only M1/M2/M3/M4/X4
+General → E/N/T only
+…we just need to tighten the filter the UI uses when you choose a family, and (optionally) add a “strict mode” switch so you can go back to cross-class Auto behavior when desired.
+
+What’s happening now (quick map to code)
+Classification:
+In lib/gcp.js → classifyGcpInstance(instance):
+
+If class is HIGHCPU → returns "compute" immediately.
+If class is HIGHMEM|ULTRAMEM|MEGAMEM → returns "memory" immediately.
+Only for STANDARD class does it decide by series (C→compute, M/X→memory, E/N/T→general).
+That’s why c4a-highmem-1 is seen as memory. The class (“highmem”) has precedence over the series (“c4a”).
+
+Allowed prefixes used by the recommender/UI:
+getGcpAllowedPrefixes(category) returns the broad lists (where memory includes M1..X4 but the classification still lets in any *-highmem-* because the class itself is memory).
+
+In most tool flows, the UI filters candidates by those allowed prefixes but the per‑instance rows and composition can still contribute *-highmem-* shapes from non‑M/X series if your selector logic admits them (e.g., you only filter after recommendation or you never filter by series at all when family ≠ Auto).
+
+Two clean ways to fix this
+Option A — UI-enforced strict families (recommended)
+When the user selects Family = Memory or Compute in the dropdown, only allow machine types whose series matches the strict set. This is a small change only in UI (no library change), so it’s low‑risk and aligns your card with the GCP console.
+
+Minimal rule (series prefix regex):
+
+Compute: ^c(2|2d|3|3d|4|4d|4a)|^h(3|4|4d) → practically: series starts with c or h3/h4/h4d
+Memory: ^m(1|2|3|4)|^x4 → series starts with m or is x4
+General: ^e2|^n1|^n2|^n2d|^n4|^n4a|^n4d|^t2a|^t2d
+What I need from you (so I can give a drop‑in patch):
+Please share the function that picks the recommended GCP machine (very likely in docs/ui/matchers.js or docs/script.js). I’ll add a 10–15 line guard that filters the candidate list by series before the price comparison, only when Family ≠ “Auto”.
+
+If you prefer a quick heuristic without touching matchers yet, you can add a small helper in the UI:
+
+
+
+
+JavaScript
+function isSeriesAllowedForFamily(series, family) {
+  const s = String(series).toLowerCase();
+  if (family === "Compute") return /^(c2|c2d|c3|c3d|c4|c4d|c4a|h3|h4|h4d)$/.test(s);
+  if (family === "Memory")  return /^(m1|m2|m3|m4|x4)$/.test(s);
+  if (family === "General") return /^(e2|n1|n2|n2d|n4|n4a|n4d|t2a|t2d)$/.test(s);
+  return true; // Auto
+}
+Then, inside your recommendation loop, extract series = instance.split('_')[0] (or use row.series if you have it) and drop any row where !isSeriesAllowedForFamily(series, selectedFamily).
+
+Pros: No change to pricing logic or library; matches how GCP Console splits families.
+Cons: In Auto you still benefit from cross-class (n2-highmem-* etc.). In Compute/Memory you will now strictly stick to series.
+
+Option B — Library toggle (strict vs cross-class)
+If you prefer to keep the logic centralized, we can add a GCP_STRICT_FAMILY=1 toggle in lib/gcp.js:
+
+Remove the precedence rule for HIGHCPU/HIGHMEM when strict, and always decide by series.
+Or keep classification as-is, but change getGcpAllowedPrefixes(category) to strict lists and have the UI/matchers rely solely on that function (you already call it).
+Pros: One switch changes behavior everywhere.
+Cons: Slightly higher risk (changes library used by provider & UI), and you may still need to ensure the UI actually filters by the prefixes before recommendation.
+
+I can do this too, but given your “let’s go one by one” approach, Option A is the smallest change.
+
+Quick UI improvement you already asked for
+You pasted utils.js. Let’s add a display helper there so your card shows hyphens for machine types:
+
+
+
+
+JavaScript
+// docs/ui/utils.js
+export function displayMachineName(name) {
+  if (name == null) return "";
+  return String(name).replace(/_/g, "-");
+}
+Then, in your GCP card render (where you build the “Recommended Machine” line), use:
+
+
+
+
+JavaScript
+import { safeSetText, displayMachineName } from "./ui/utils.js";
+
+// ...
+const shownName = displayMachineName(rec.machineType || rec.instance);
+safeSetText("gcpInstance",
+  `<strong>Recommended Machine:</strong> ${shownName} (${region})`,
+  { html: true }
+);
+That will fix the underscore vs hyphen display immediately.
+
+Next step (your call)
+If you send me docs/ui/matchers.js (and/or the function that builds the GCP recommendation), I’ll give you a precise drop‑in that:
+Applies strict series filtering when Family = Compute/Memory/General, and
+Leaves Auto behavior unchanged.
+Once we do that, choosing Memory will only ever suggest M1/M2/M3/M4/X4; choosing Compute will only ever suggest C2/C2D/C3/C3D/C4/C4D/C4A/H3/H4/H4D—exactly like the console’s series pickers.
+
+
+
+
+
+
+
+
+image.png
+image.png
+image.png
+You said:
+i want similar mapping 
+Copilot said:
+Copilot
+
+Reasoning completed in 2 steps
+Perfect—let’s make your GCP Family → Series behave like the Google calculator’s two‑step picker (“Machine family” → “Series”). We’ll do it in a strict way so that:
+
+General Purpose only shows: C4D, C4A, C4, N4, N4D (and we can extend with E/N/T if you want).
+Compute‑optimized only shows: C2, C2D, H3, H4D.
+Memory‑optimized only shows: M1, M2, M3, M4.
+Then we’ll use the chosen Series to filter the recommendation candidates.
+
+We’ll keep this change UI‑only (no provider/library change), so it’s low‑risk and easy to revert.
+
+1) Add a strict mapping (families → series + labels)
+Create a mapping you can reuse across UI. The following goes well in docs/ui/utils.js (near the other helpers). It includes labels so you can render a series dropdown that looks like the calculator.
+
+
+
+
+JavaScript
+/* ---------- GCP family → series mapping (strict, console-like) ---------- */
+/** 
+ * Notes:
+ * - This mirrors current console groupings you showed:
+ *   General Purpose → C4D, C4A, C4, N4, N4D
+ *   Compute-optimized → C2, C2D, H3, H4D
+ *   Memory-optimized → M1, M2, M3, M4
+ * - You can extend GENERAL with E2/N1/N2/N2D/T2A/T2D if desired.
+ */
+export const GCP_SERIES_BY_FAMILY = {
+  General: [
+    { value: "C4D", label: "C4D — Consistently high performance" },
+    { value: "C4A", label: "C4A — Arm-based consistently high performance" },
+    { value: "C4",  label: "C4 — Consistently high performance" },
+    { value: "N4",  label: "N4 — Flexible & cost-optimized" },
+    { value: "N4D", label: "N4D — Cost optimization & enhanced price-performance" },
+
+    // (Optional) Uncomment if you want legacy general alongside new lines:
+    // { value: "E2",  label: "E2 — Cost-optimized general purpose" },
+    // { value: "N1",  label: "N1 — General purpose (legacy)" },
+    // { value: "N2",  label: "N2 — General purpose" },
+    // { value: "N2D", label: "N2D — General purpose (AMD)" },
+    // { value: "T2A", label: "T2A — Arm-based general purpose" },
+    // { value: "T2D", label: "T2D — Tau general purpose (AMD)" },
+  ],
+  Compute: [
+    { value: "C2",  label: "C2 — Ultra high performance for compute‑intensive workloads" },
+    { value: "C2D", label: "C2D — Ultra high performance for compute‑intensive workloads" },
+    { value: "H3",  label: "H3 — Ultra high performance for compute‑intensive workloads" },
+    { value: "H4D", label: "H4D — Ultra high performance for compute‑intensive workloads" },
+  ],
+  Memory: [
+    { value: "M1", label: "M1 — Highest memory to compute ratios" },
+    { value: "M2", label: "M2 — Highest memory to compute ratios" },
+    { value: "M3", label: "M3 — Highest memory to compute ratios" },
+    { value: "M4", label: "M4 — Highest memory to compute ratios" },
+  ],
+};
+
+/** Return series list (labels included) for a given family selection. */
+export function getGcpSeriesOptionsForFamily(family) {
+  if (!family || family === "Auto" || family === "Auto (Recommended)") return [];
+  return (GCP_SERIES_BY_FAMILY[family] || []).map(s => ({ value: s.value, text: s.label }));
+}
+
+/** True iff a machine's series (e.g., "c4d") belongs to the selected family (strict mode). */
+export function isGcpSeriesAllowedForFamily(series, family) {
+  if (!family || family === "Auto" || family === "Auto (Recommended)") return true;
+  const s = String(series || "").toUpperCase();
+  const allow = new Set((GCP_SERIES_BY_FAMILY[family] || []).map(x => x.value));
+  return allow.has(s);
+}
+``
+
+Show more lines
+2) Populate a Series dropdown when Family changes
+In your UI controller (likely docs/script.js or docs/ui/state.js), when the GCP Family <select> changes:
+
+Build the associated Series <select> from getGcpSeriesOptionsForFamily(family).
+If the user picks a series, we’ll constrain candidates to that series only.
+If the Series select is empty (e.g., “Auto”), hide/disable it.
+Example handler (you’ll already have similar code):
+
+
+
+
+JavaScript
+import { fillSelect, ensureSelectOption, getGcpSeriesOptionsForFamily } from "./ui/utils.js";
+
+// Called whenever the GCP Family select changes:
+function onGcpFamilyChanged() {
+  const fam = document.getElementById("gcpFamily").value;
+
+  // Populate series list for this family
+  const seriesOpts = getGcpSeriesOptionsForFamily(fam);
+  const seriesSelectId = "gcpSeries"; // add a <select id="gcpSeries"> near the family control
+  if (seriesOpts.length) {
+    fillSelect(seriesSelectId, seriesOpts);
+    document.getElementById(seriesSelectId).disabled = false;
+    document.getElementById(seriesSelectId).closest(".series-row")?.classList.remove("hidden");
+  } else {
+    fillSelect(seriesSelectId, []);
+    document.getElementById(seriesSelectId).disabled = true;
+    document.getElementById(seriesSelectId).closest(".series-row")?.classList.add("hidden");
+  }
+
+  // Trigger recompute/recommendation after changing the family/series UI
+  recomputeGcpRecommendation();
+}
+
+Show more lines
+UI note: Add a light wrapper <div class="series-row hidden"> containing your new Series <select id="gcpSeries">, and toggle .hidden as above.
+
+3) Filter recommendation candidates by Family and Series
+In your recommendation function (where you traverse gcp.prices.json rows to pick the cheapest that meets vCPU/RAM), add two strict filters before price comparison:
+
+
+
+
+JavaScript
+import { isGcpSeriesAllowedForFamily } from "./ui/utils.js";
+
+function recommendGcpMachine(rows, user) {
+  const family = document.getElementById("gcpFamily").value;           // "Auto" | "General" | "Compute" | "Memory"
+  const seriesSelEl = document.getElementById("gcpSeries");
+  const seriesPicked = seriesSelEl && !seriesSelEl.disabled ? String(seriesSelEl.value || "") : "";
+
+  const filtered = rows.filter(r => {
+    // r.series already exists from provider ("n2", "c4d", "m2", ...)
+    const series = String(r.series || "").toUpperCase();
+
+    // 1) family strict filter
+    if (!isGcpSeriesAllowedForFamily(series, family)) return false;
+
+    // 2) series exact filter (if user has selected a series)
+    if (seriesPicked && series !== seriesPicked) return false;
+
+    // 3) (optional) category check you might already have, plus vCPU/RAM constraints, OS, region, etc.
+    return true;
+  });
+
+  // ...then run your usual scoring / min price logic on `filtered`
+  // pick the best match and render to the card
+}
+``
+
+Show more lines
+Result
+
+If the user selects Family = Memory, only M1/M2/M3/M4 candidates are considered.
+If the user also picks Series = M2, only M2 shapes are considered.
+If Family = Auto, the Series select is hidden and all series are allowed (cross‑class is fine in Auto).
+4) Small polish you already wanted (hyphens)
+You added displayMachineName earlier. Make sure it’s used wherever you print the machine type:
+
+
+
+
+JavaScript
+import { displayMachineName } from "./ui/utils.js";
+
+safeSetText("gcpInstance",
+  `<strong>Recommended Machine:</strong> ${displayMachineName(rec.machineType || rec.instance)} (${region})`,
+  { html: true }
+);
+5) (Optional) Extend “General Purpose” with legacy series
+If you want General to also show E2 / N1 / N2 / N2D / T2A / T2D (older calculator pages often include them), just uncomment those lines in GCP_SERIES_BY_FAMILY.General. They’ll appear in the Series dropdown and become selectable + filterable the same way.
+
+6) Quick test plan
+General Purpose:
+
+Pick Series = C4D → Ensure recommendations are only c4d-*.
+Pick Series = N4 → Ensure recommendations are only n4-*.
+Compute‑optimized:
+
+Pick Series = C2 → Only c2-* should show up.
+Memory‑optimized:
+
+Pick Series = M1 → Only m1-* (e.g., m1-ultramem-*).
+Auto:
+
+Confirm the Series dropdown hides and recommendation can choose cross‑class (n2-highmem-*, e2-highcpu-*, etc.) if those are cheaper for the request.
+If you paste the small part of your recommend function (or the file where you build the GCP candidate list), I’ll give you a ready drop‑in with the two filters wired in and the Series control hooked up.
