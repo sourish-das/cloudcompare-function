@@ -1,0 +1,30 @@
+2) Better file name (timestamp + inputs)
+Add date/time and key inputs to the filename so users can trace exports later.
+
+// replace the final save() block
+const os = document.getElementById("os")?.value || "OS";
+const v  = document.getElementById("cpu")?.value || "";
+const m  = document.getElementById("ram")?.value || "";
+const st = document.getElementById("storageType")?.value || "";
+const sg = document.getElementById("storageAmt")?.value || "";
+const ts = new Date().toISOString().replace(/[:.]/g, "-"); // YYYY-MM-DDTHH-MM-SSZ
+
+pdf.save(`cloud-compare_${os}_${v}vCPU_${m}GB_${sg}GB-${st}_${ts}.pdf`);
+
+
+4) Keep Export disabled when filters change
+Prevents exporting stale results if the user changes inputs after “Compare”.
+
+
+// in bootstrap(), with your other listeners:
+[
+  "os", "cpu", "ram", "storageType", "storageAmt",
+  "awsFamily","azFamily","gcpFamily","ociProcessor"
+].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("change", () => {
+    const dl = document.getElementById("downloadPdfBtn");
+    if (dl) dl.disabled = true; // force re-compare before export
+  });
+});
