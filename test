@@ -1,5 +1,10 @@
-// scripts/lib/gcp.js
-// Replace extractHourlyPrice with this safer, conversion-aware version.
+Fix price undercount from “packed” SKUs (per‑10 units)
+Where: scripts/lib/gcp.js → function extractHourlyPrice(pricingInfo)
+What to change: keep your conversion-aware logic exactly as is, and add pack handling at the end to account for SKUs whose price is published for a display pack (often 10 vCPU‑hours / 10 GiB‑hours). Use pricingExpression.displayQuantity and (optionally) usageUnitDescription to detect and un‑pack.
+
+Why: Some Compute Engine core / RAM unit SKUs use a displayQuantity (e.g., 10). If you treat the returned unitPrice as “per 1 vCPU‑hour” you undercount by 10×. Google’s PricingExpression docs explicitly describe displayQuantity and the conversion fields (usageUnit, baseUnit, baseUnitConversionFactor).
+
+// Replace the entire function with this version
 function extractHourlyPrice(pricingInfo) {
   for (const p of (pricingInfo || [])) {
     const pe = p?.pricingExpression;
@@ -8,7 +13,7 @@ function extractHourlyPrice(pricingInfo) {
     if (!rate) continue;
 
     // Raw money amount (in the unit described by usage/base below)
-    const money = Number(rate.units || 0) + Number(rate.nanos || 0) / 1e9;
+    let money = Number(rate.units || 0) + Number(rate.nanos || 0) / 1e9;
     if (!(money > 0)) continue;
 
     const usage = String(pe.usageUnit || "").toLowerCase();   // e.g., 'h', 's', 'min'
@@ -16,26 +21,44 @@ function extractHourlyPrice(pricingInfo) {
     const k     = Number(pe.baseUnitConversionFactor || 1);   // e.g., 3600 when mapping base->usage
 
     // If the usage unit explicitly says hours, treat 'money' as already $/hour.
+    let hourly;
     if (usage === "h" || usage === "hour" || usage === "hours") {
-      return money;
+      hourly = money;
+    } else if (usage === "s" || usage === "sec" || usage === "second" || usage === "seconds") {
+      hourly = money * 3600; // seconds -> hours
+    } else if (usage === "min" || usage === "minute" || usage === "minutes") {
+      hourly = money * 60;   // minutes -> hours
+    } else if (base === "s" || base === "sec" || base === "second" || base === "seconds") {
+      // If usageUnit is empty but baseUnit is seconds, multiply once by factor to reach hours.
+      hourly = money * (k > 0 ? k : 3600);
+    } else {
+      // Default: assume already per hour.
+      hourly = money;
     }
 
-    // If usage is seconds/minutes, convert to per hour.
-    if (usage === "s" || usage === "sec" || usage === "second" || usage === "seconds") {
-      return money * 3600;
-    }
-    if (usage === "min" || usage === "minute" || usage === "minutes") {
-      return money * 60;
-    }
+    // --- NEW: handle "display packs" (e.g., price is for 10 vCPU-hrs or 10 GiB-hrs) ---
+    const dq = Number(pe.displayQuantity || 1);
+    const ud = String(pe.usageUnitDescription || "").toLowerCase();
+    const mentionsTenPack = dq >= 10 && (/\b10\b/.test(ud) && /\b(vcpu|core|gb|gib|memory|ram)\b/.test(ud));
 
-    // If usageUnit is empty but baseUnit is given, use base->hour via factor or fallback.
-    if (base === "s" || base === "sec" || base === "second" || base === "seconds") {
-      // If factor says how many seconds compose one hour (often 3600), multiply once.
-      return money * (k > 0 ? k : 3600);
+    // Heuristic: if displayQuantity >= 10 and description implies a 10-pack,
+    // or the computed hourly looks implausibly small for core/ram SKUs (<~0.05),
+    // scale by displayQuantity to get the true per-hour, per-VM unit rate.
+    if (dq >= 10 && (mentionsTenPack || hourly < 0.05)) {
+      hourly *= dq;
     }
+    // -------------------------------------------------------------------------------
 
-    // Default: assume already per hour.
-    return money;
+    return hourly;
   }
   return null;
 }
+
+Align HIGHCPU RAM for modern families (optional but recommended)
+Where: scripts/lib/gcp.js → function deriveVcpuRamFromType(mt)
+What to change: keep N1’s legacy rule (0.9 GiB/vCPU), but set 2 GiB/vCPU for modern HIGHCPU (N4/N4A/C4/C4D etc.). This matches Google’s published machine family ratios and prevents unexpected RAM mismatches in the UI for new series.
+
+if (cls.startsWith("highcpu")) {
+    if (series.startsWith("n1")) return { vcpu, ram: vcpu * 0.9 }; // legacy N1
+    return { vcpu, ram: vcpu * 2 }; // modern families: 2 GiB per vCPU
+  }
