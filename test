@@ -1,73 +1,41 @@
-1) Script change (recommended, robust)
-Where: inside downloadResultsAsPdf(), after:
-const clone = grid.cloneNode(true);
+// scripts/lib/gcp.js
+// Replace extractHourlyPrice with this safer, conversion-aware version.
+function extractHourlyPrice(pricingInfo) {
+  for (const p of (pricingInfo || [])) {
+    const pe = p?.pricingExpression;
+    if (!pe) continue;
+    const rate = pe?.tieredRates?.[0]?.unitPrice;
+    if (!rate) continue;
 
-Add this block:
+    // Raw money amount (in the unit described by usage/base below)
+    const money = Number(rate.units || 0) + Number(rate.nanos || 0) / 1e9;
+    if (!(money > 0)) continue;
 
-// --- Replace <select> controls in the CLONE with styled text snapshots ---
-(function snapshotSelects(root) {
-  const all = root.querySelectorAll("select");
-  all.forEach(sel => {
-    // Read selected text
-    const txt = sel.options?.[sel.selectedIndex]?.text ?? sel.value ?? "";
+    const usage = String(pe.usageUnit || "").toLowerCase();   // e.g., 'h', 's', 'min'
+    const base  = String(pe.baseUnit   || "").toLowerCase();  // e.g., 's'
+    const k     = Number(pe.baseUnitConversionFactor || 1);   // e.g., 3600 when mapping base->usage
 
-    // Approximate the current width (fallback if 0)
-    const approxWidth = Math.max(120, sel.getBoundingClientRect()?.width || sel.offsetWidth || 140);
+    // If the usage unit explicitly says hours, treat 'money' as already $/hour.
+    if (usage === "h" || usage === "hour" || usage === "hours") {
+      return money;
+    }
 
-    // Build a <span> that looks like a compact input/select
-    const span = document.createElement("span");
-    span.className = "cc-select-snapshot";
-    span.textContent = txt;
+    // If usage is seconds/minutes, convert to per hour.
+    if (usage === "s" || usage === "sec" || usage === "second" || usage === "seconds") {
+      return money * 3600;
+    }
+    if (usage === "min" || usage === "minute" || usage === "minutes") {
+      return money * 60;
+    }
 
-    // Inline styles so html2canvas captures exactly this look
-    span.style.display = "inline-block";
-    span.style.minWidth = approxWidth + "px";
-    span.style.height = "30px";
-    span.style.lineHeight = "28px";
-    span.style.padding = "0 8px";
-    span.style.border = "1px solid #999";
-    span.style.borderRadius = "4px";
-    span.style.background = "#fff";
-    span.style.color = "#111";
-    span.style.fontSize = "12px";
-    span.style.whiteSpace = "nowrap";
-    span.style.overflow = "hidden";
-    span.style.textOverflow = "ellipsis";
-    span.style.verticalAlign = "middle";
+    // If usageUnit is empty but baseUnit is given, use base->hour via factor or fallback.
+    if (base === "s" || base === "sec" || base === "second" || base === "seconds") {
+      // If factor says how many seconds compose one hour (often 3600), multiply once.
+      return money * (k > 0 ? k : 3600);
+    }
 
-    // Replace only in the export clone
-    sel.replaceWith(span);
-  });
-})(clone);
-
-
-Then continue with your existing lines:
-wrapper.appendChild(clone);
-
-
-
-2) Keep your rows aligned in the export clone (still in script.js)
-You already create an injected <style> as styleOverride. Append the following rules to its textContent so html2canvas sees them in the wrapper:
-styleOverride.textContent += `
-  /* Align "Family"/"Processor" rows cleanly in export clone */
-  .family-filter,
-  .panel .label-with-info {
-    display: flex !important;
-    flex-direction: row !important;
-    align-items: center !important;
-    gap: 8px !important;
-    margin: 6px 0 !important;
+    // Default: assume already per hour.
+    return money;
   }
-  .family-filter label,
-  .panel .label-with-info label {
-    flex: 0 0 80px !important;
-    font-weight: 700 !important;
-    margin: 0 !important;
-  }
-
-  /* Snapshot spans look like compact inputs */
-  .cc-select-snapshot {
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
-  }
-`;
-
+  return null;
+}
